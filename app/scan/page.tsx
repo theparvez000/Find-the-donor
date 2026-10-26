@@ -5,9 +5,9 @@ import { browserClient } from "@/lib/browser";
 import { BLOOD_GROUPS, DISTRICTS } from "@/lib/data";
 
 type D = { id: string; display_name: string; blood_group: string; district: string; upazila: string | null; status: string; availability_updated_at: string | null; last_donation: string | null; distance_km: number | null };
-type Phase = "idle" | "searching" | "matching" | "results" | "error";
+// "searching" lasts exactly as long as the real Supabase request. There is no artificial delay.
+type Phase = "idle" | "searching" | "results" | "error";
 const configured = !!process.env.NEXT_PUBLIC_SUPABASE_URL && !!process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const PARTICLES = [[12, 30, 0], [80, 18, 1], [66, 82, 2], [25, 74, 3], [90, 56, 1.5], [44, 10, 2.5], [8, 58, 0.5], [58, 92, 3.5]];
 const CSS = `
 .radar{position:relative;width:min(78vw,320px);aspect-ratio:1;margin:0 auto;border-radius:9999px;background:radial-gradient(circle,#fff 0,#fef2f2 70%);border:1px solid #fecaca;overflow:hidden}
@@ -21,10 +21,12 @@ const CSS = `
 .radar .dot{position:absolute;width:12px;height:12px;margin:-6px 0 0 -6px;border-radius:9999px;background:#b91c1c;box-shadow:0 0 0 4px rgba(185,28,28,.2);animation:pop .5s both}
 .radar .part{position:absolute;width:4px;height:4px;border-radius:9999px;background:#b91c1c;opacity:0}
 .radar.on .part{animation:twinkle 3s ease-in-out infinite}
+.indet{position:relative;overflow:hidden}.indet::after{content:"";position:absolute;top:0;bottom:0;width:40%;background:#b91c1c;animation:slide 1.2s ease-in-out infinite}
 .fadein{animation:fade .5s both}
 @keyframes spin{to{transform:rotate(360deg)}}@keyframes pulse{0%{transform:scale(.15);opacity:.7}100%{transform:scale(1);opacity:0}}
 @keyframes pop{from{transform:scale(0);opacity:0}to{transform:scale(1);opacity:1}}@keyframes twinkle{0%,100%{opacity:0}50%{opacity:.6}}@keyframes fade{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
-@media (prefers-reduced-motion:reduce){.radar *,.fadein{animation:none!important}}`;
+@keyframes slide{from{transform:translateX(-100%)}to{transform:translateX(250%)}}
+@media (prefers-reduced-motion:reduce){.radar *,.fadein,.indet::after{animation:none!important}}`;
 
 const BADGE: Record<string, [string, string]> = { available: ["Available", "bg-green-100 text-green-800"], stale: ["Availability unknown (30+ days old)", "bg-yellow-100 text-yellow-800"] };
 const ago = (iso: string | null) => { if (!iso) return ""; const d = Math.floor((Date.now() - new Date(iso).getTime()) / 86400000); return d <= 0 ? "Updated today" : `Updated ${d} day${d > 1 ? "s" : ""} ago`; };
@@ -58,24 +60,22 @@ export default function Scan() {
   async function start() {
     const id = ++run.current; setPhase("searching"); setErr(""); setDonors([]); setNote(null);
     if (!configured) { setErr("Database unavailable: the site is not connected to Supabase."); return setPhase("error"); }
-    ctrl.current?.abort(); const c = new AbortController(); ctrl.current = c; const t0 = Date.now();
+    ctrl.current?.abort(); const c = new AbortController(); ctrl.current = c;
     const { data, error } = await browserClient().rpc("scan_donors", { p_group: group, p_district: district || null, p_upazila: upazila.trim() || null, p_lat: loc?.lat ?? null, p_lng: loc?.lng ?? null, p_radius_km: loc ? radius : 0, p_limit: 30 }).abortSignal(c.signal);
-    if (id !== run.current) return;
+    if (id !== run.current) return; // cancelled or superseded
     if (error) { setErr("Database unavailable. Please try again in a moment."); return setPhase("error"); }
-    setDonors((data ?? []) as D[]); setPhase("matching");
-    await wait(Math.max(1500, 2200 - (Date.now() - t0)));
-    if (id === run.current) setPhase("results");
+    setDonors((data ?? []) as D[]);
+    setPhase("results"); // the animation ends the moment the real query returns
   }
   function cancel() { run.current++; ctrl.current?.abort(); setPhase("idle"); }
   async function contact(d: D) {
     const sb = browserClient(); const { data: s } = await sb.auth.getSession();
     if (!s.session) return setNote({ id: d.id, ok: false, t: "Please sign in to send a contact request." });
     const { error } = await sb.from("donor_contact_requests").insert({ donor_id: d.id, requester_id: s.session.user.id, blood_group: group });
-    setNote({ id: d.id, ok: !error, t: !error ? "Request recorded. The donor-side inbox is not released yet, so no one is notified." : error.code === "23505" ? "You already sent a request to this donor today." : "Could not send. You may have reached today's limit, or the donor is no longer available." });
+    setNote({ id: d.id, ok: !error, t: !error ? "Request sent. The donor can answer from their inbox; their reply will appear in your Inbox. No phone number is shared." : error.code === "23505" ? "You already sent a request to this donor today." : "Could not send. You may have reached today's limit, or the donor is no longer available." });
   }
 
-  const busy = phase === "searching" || phase === "matching";
-  const stage = phase === "searching" ? "Searching…" : phase === "matching" ? "Matching donors…" : "";
+  const busy = phase === "searching";
   const withDist = donors.filter((d) => d.distance_km != null); const noDist = donors.filter((d) => d.distance_km == null);
 
   return (<div className="mx-auto max-w-3xl"><style>{CSS}</style>
@@ -88,16 +88,17 @@ export default function Scan() {
       <label className="text-sm font-medium">Upazila / area (optional)<input value={upazila} onChange={(e) => setUpazila(e.target.value)} maxLength={60} className="input mt-1"/></label>
       <label className="text-sm font-medium">Radius (with location)<select value={radius} onChange={(e) => setRadius(Number(e.target.value))} disabled={!loc} className="input mt-1">{[1, 3, 5, 10, 25].map((k) => <option key={k} value={k}>{k} km</option>)}<option value={0}>Any distance</option></select></label>
       <div className="flex flex-wrap items-center gap-3 sm:col-span-2"><button type="button" onClick={locate} className="rounded-lg border border-brand-600 px-4 py-2 text-sm font-semibold text-brand-700">📍 Use my location (optional)</button><span className="text-xs text-gray-600" role="status">{locMsg}</span></div>
-      <button className="btn sm:col-span-2">Scan for {group} donors</button>
+      <button className="btn sm:col-span-2">{phase === "error" ? "Retry scan" : `Scan for ${group} donors`}</button>
       {phase === "error" && <p role="alert" className="rounded-lg bg-red-50 p-3 text-sm sm:col-span-2">{err}</p>}
     </form>}
 
-    {busy && <div className="mt-6 text-center"><Radar on label={group} donors={donors} maxKm={maxKm} showDots={phase === "matching"}/>
-      <p className="mt-4 font-semibold text-brand-700" role="status">{stage}</p>
-      <div className="mx-auto mt-2 h-1.5 w-56 overflow-hidden rounded-full bg-brand-50"><div className="h-full bg-brand-600 transition-all duration-700" style={{ width: phase === "searching" ? "35%" : "85%" }}/></div>
+    {busy && <div className="mt-6 text-center"><Radar on label={group} donors={[]} maxKm={maxKm} showDots={false}/>
+      <p className="mt-4 font-semibold text-brand-700" role="status">Searching the donor database…</p>
+      <div className="indet mx-auto mt-2 h-1.5 w-56 rounded-full bg-brand-50" aria-hidden="true"/>
       <button onClick={cancel} className="mt-4 rounded-lg border px-4 py-2 text-sm font-semibold">Stop scan</button></div>}
 
     {phase === "results" && <section className="fadein mt-6">
+      {donors.length > 0 && <div className="mx-auto mb-4 max-w-[220px]"><Radar on={false} label={group} donors={donors} maxKm={maxKm} showDots/></div>}
       <div className="flex flex-wrap items-center justify-between gap-2">
         <h2 className="text-lg font-bold" role="status">{donors.length ? `Donors found: ${donors.length}` : "No donors found"}</h2>
         <div className="flex gap-2"><div className="flex overflow-hidden rounded-lg border text-sm" role="group" aria-label="View">{(["list", "map"] as const).map((v) => <button key={v} aria-pressed={view === v} onClick={() => setView(v)} className={`px-3 py-1.5 ${view === v ? "bg-brand-600 text-white" : ""}`}>{v === "list" ? "List" : "Distance map"}</button>)}</div>
