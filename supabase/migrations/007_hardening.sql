@@ -1,39 +1,17 @@
 -- 007_hardening.sql  --  NOT YET APPLIED. Review, then apply once, after 006.
--- Verified against live project before writing: tables profiles, blood_requests (0 rows), reports (0 rows),
--- donor_contact_requests, admin_audit_logs exist; functions from 001-005 exist; supabase_migrations history is empty
--- (earlier SQL was run by hand), so check each object below before running.
+-- Verified against the live project before writing: tables profiles, blood_requests (0 rows), reports (0 rows),
+-- donor_contact_requests, admin_audit_logs exist; functions from 001-005 exist; the supabase_migrations history is
+-- empty (earlier SQL was run by hand), so re-check each object before running.
 
--- 1. Fixed search_path on helper/trigger functions (Supabase advisor 0011).
+-- 1. Fixed search_path on helper functions (Supabase advisor 0011).
 alter function is_admin() set search_path = public;
 alter function protect_role() set search_path = public;
 alter function limit_contact_requests() set search_path = public;
 alter function set_responded_at() set search_path = public;
 
--- 2. Availability freshness cannot be faked by editing the timestamp. Timestamp changes only when the status
---    changes, or through confirm_availability() below. (Replaces the 002 function; same behaviour otherwise.)
-create or replace function profiles_before_write() returns trigger language plpgsql set search_path = public as $$
-begin
-  if tg_op = 'INSERT' or new.availability_status is distinct from old.availability_status then
-    new.availability_updated_at := now();
-  else
-    new.availability_updated_at := old.availability_updated_at;
-  end if;
-  if new.availability_status <> 'unavailable' then new.unavailable_reason := null; end if;
-  if not new.location_consent then new.approx_lat := null; new.approx_lng := null; end if;
-  new.approx_lat := round(new.approx_lat, 2); new.approx_lng := round(new.approx_lng, 2);
-  new.updated_at := now();
-  return new;
-end $$;
-
--- One-click "I am still available": refreshes freshness without changing status. Only for the caller's own profile.
-create or replace function confirm_availability() returns void language sql security definer set search_path = public as $$
-  update profiles set availability_updated_at = now() where id = auth.uid() and availability_status = 'available';
-$$;
-revoke execute on function confirm_availability() from public, anon;
-grant execute on function confirm_availability() to authenticated;
-
--- NOTE: the trigger above overwrites availability_updated_at on every update, including confirm_availability().
--- To let the RPC through, it sets a transaction-local flag that the trigger honours:
+-- 2. Availability freshness cannot be faked by editing the timestamp. It changes only when the status changes
+--    or through confirm_availability(), which sets a transaction-local flag the trigger honours.
+--    (Replaces the 002 function; all other behaviour is unchanged.)
 create or replace function profiles_before_write() returns trigger language plpgsql set search_path = public as $$
 begin
   if tg_op = 'INSERT' or new.availability_status is distinct from old.availability_status
@@ -44,10 +22,12 @@ begin
   end if;
   if new.availability_status <> 'unavailable' then new.unavailable_reason := null; end if;
   if not new.location_consent then new.approx_lat := null; new.approx_lng := null; end if;
-  new.approx_lat := round(new.approx_lat, 2); new.approx_lng := round(new.approx_lng, 2);
+  new.approx_lat := round(new.approx_lat, 2); new.approx_lng := round(new.approx_lng, 2);  -- ~1 km, never exact
   new.updated_at := now();
   return new;
 end $$;
+
+-- One-click "I am still available": refreshes freshness for the caller's own profile only, without changing status.
 create or replace function confirm_availability() returns void language plpgsql security definer set search_path = public as $$
 begin
   perform set_config('app.confirm_availability', 'on', true);
@@ -59,10 +39,10 @@ grant execute on function confirm_availability() to authenticated;
 
 -- 3. Trigger-only security-definer function must not be callable as an RPC (advisor 0028/0029).
 revoke execute on function log_request_status() from public, anon, authenticated;
--- Requester view of own sent requests needs a signed-in user.
+-- my_sent_requests needs a signed-in user.
 revoke execute on function my_sent_requests() from public, anon;
 grant execute on function my_sent_requests() to authenticated;
--- Deliberately left executable by anon: scan_donors, search_donors (public search), is_admin and can_contact (used inside RLS policies).
+-- Deliberately left executable by anon: scan_donors, search_donors (public search); is_admin, can_contact (used inside RLS policies).
 
 -- 4. Blood requests: urgency + required-by, requester binding, spam and duplicate limits.
 alter table blood_requests
@@ -73,7 +53,7 @@ drop policy if exists "submit request" on blood_requests;
 create policy "submit request" on blood_requests for insert
   with check (status = 'pending' and (requester_id is null or requester_id = auth.uid()));
 
--- security definer so the checks can see all rows despite RLS (anon cannot read blood_requests).
+-- security definer so the checks see all rows despite RLS (anon cannot read blood_requests).
 create or replace function limit_requests() returns trigger language plpgsql security definer set search_path = public as $$
 begin
   if (select count(*) from blood_requests where lower(contact) = lower(new.contact) and created_at > now() - interval '24 hours') >= 3 then
